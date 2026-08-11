@@ -10,6 +10,26 @@ import (
 	"time"
 )
 
+// modelRoutes holds the "requested model" -> "actual model to use" overrides,
+// loaded once at startup from model_routes.json.
+var modelRoutes = map[string]string{}
+
+// loadModelRoutes reads model_routes.json from disk into the modelRoutes map.
+// If the file doesn't exist, that's fine - it just means no overrides are
+// configured, so we continue with an empty map instead of crashing.
+func loadModelRoutes() {
+	data, err := os.ReadFile("model_routes.json")
+	if err != nil {
+		fmt.Println("No model_routes.json found, running with no model overrides")
+		return
+	}
+	if err := json.Unmarshal(data, &modelRoutes); err != nil {
+		fmt.Println("Failed to parse model_routes.json:", err)
+		return
+	}
+	fmt.Println("Loaded model routing overrides:", modelRoutes)
+}
+
 // providers holds one instance of each provider adapter, keyed by the name
 // used in the URL, e.g. /v1/chat/completions/groq or /v1/chat/completions/gemini.
 var providers = map[string]Provider{
@@ -30,7 +50,7 @@ var pricePerMillion = map[string]struct {
 	Output float64
 }{
 	"llama-3.1-8b-instant": {Input: 0.05, Output: 0.08},
-	"gemini-1.5-flash":     {Input: 0.075, Output: 0.30},
+	"gemini-3.6-flash":     {Input: 0.075, Output: 0.30}, // placeholder pricing - confirm current rate on Google's pricing page
 }
 
 func calculateCost(model string, promptTokens, completionTokens int) float64 {
@@ -97,6 +117,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &chatReq); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
+	}
+
+	// Check if this model has a configured override - if so, swap it
+	// before we ever build the provider request, so everything downstream
+	// (billing, logging) reflects the model actually used.
+	originalModel := chatReq.Model
+	if override, exists := modelRoutes[chatReq.Model]; exists {
+		fmt.Printf("[MODEL SWITCH] requested=%s -> actual=%s\n", originalModel, override)
+		chatReq.Model = override
 	}
 
 	apiKey := os.Getenv(apiKeyEnvVar[providerName])

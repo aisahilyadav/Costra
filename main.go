@@ -29,6 +29,8 @@ func main() {
 	}
 	fmt.Println("Connected to Postgres successfully")
 
+	loadModelRoutes()
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Costra is alive")
 	})
