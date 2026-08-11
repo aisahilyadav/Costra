@@ -92,26 +92,40 @@ func calculateCost(model string, promptTokens, completionTokens int) float64 {
 	return inputCost + outputCost
 }
 
+// attribution groups the optional "who/what caused this request" metadata
+// together, so we don't have to pass four separate string parameters around.
+type attribution struct {
+	SessionID string
+	AgentID   string
+	TaskID    string
+	UserID    string
+}
+
 // logUsage now inserts a row into Postgres instead of just printing.
 // We still print too, for now, since it's a helpful sanity check while learning.
-func logUsage(model string, usage Usage, latency time.Duration, streaming bool, status string) {
+func logUsage(model string, usage Usage, latency time.Duration, streaming bool, status string, attr attribution) {
 	cost := calculateCost(model, usage.PromptTokens, usage.CompletionTokens)
 	latencyMs := int(latency.Milliseconds())
 
 	fmt.Printf(
-		"[USAGE] model=%s stream=%v prompt_tokens=%d completion_tokens=%d total_tokens=%d cost=$%.6f latency=%s\n",
+		"[USAGE] model=%s stream=%v prompt_tokens=%d completion_tokens=%d total_tokens=%d cost=$%.6f latency=%s session=%s agent=%s\n",
 		model, streaming, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cost, latency,
+		attr.SessionID, attr.AgentID,
 	)
 
 	// $1, $2, $3... are placeholders - Postgres fills them in safely,
 	// which protects us from SQL injection compared to building the query
 	// string by hand.
+	// Empty strings ("") get stored as empty strings, not NULL - that's fine
+	// for our purposes here, and keeps the insert logic simple.
 	_, err := db.Exec(
 		`INSERT INTO requests
-			(provider, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, streaming, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			(provider, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, streaming, status,
+			 session_id, agent_id, task_id, user_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		"groq", model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens,
 		cost, latencyMs, streaming, status,
+		attr.SessionID, attr.AgentID, attr.TaskID, attr.UserID,
 	)
 	if err != nil {
 		fmt.Println("Failed to write usage log to database:", err)
@@ -120,6 +134,16 @@ func logUsage(model string, usage Usage, latency time.Duration, streaming bool, 
 
 func proxyToGroq(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+
+	// Read optional attribution headers. r.Header.Get returns "" if the
+	// header wasn't sent at all, which is exactly the behavior we want -
+	// these are all optional.
+	attr := attribution{
+		SessionID: r.Header.Get("X-Session-Id"),
+		AgentID:   r.Header.Get("X-Agent-Id"),
+		TaskID:    r.Header.Get("X-Task-Id"),
+		UserID:    r.Header.Get("X-User-Id"),
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -156,7 +180,7 @@ func proxyToGroq(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if peek.Stream {
-		streamAndCapture(w, resp.Body, peek.Model, startTime, status)
+		streamAndCapture(w, resp.Body, peek.Model, startTime, status, attr)
 	} else {
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -168,11 +192,11 @@ func proxyToGroq(w http.ResponseWriter, r *http.Request) {
 		var parsed chatResponse
 		json.Unmarshal(respBody, &parsed)
 		latency := time.Since(startTime)
-		logUsage(peek.Model, parsed.Usage, latency, false, status)
+		logUsage(peek.Model, parsed.Usage, latency, false, status, attr)
 	}
 }
 
-func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, startTime time.Time, status string) {
+func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, startTime time.Time, status string, attr attribution) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		io.Copy(w, body)
@@ -204,5 +228,5 @@ func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, start
 	}
 
 	latency := time.Since(startTime)
-	logUsage(model, capturedUsage, latency, true, status)
+	logUsage(model, capturedUsage, latency, true, status, attr)
 }
