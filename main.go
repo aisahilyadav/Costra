@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,12 +13,35 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq" // Postgres driver - imported for its side effect of registering itself with database/sql
 )
+
+// db is a package-level variable holding our database connection pool,
+// so any function in this file can use it without passing it around manually.
+var db *sql.DB
 
 func main() {
 	if err := godotenv.Load(); err != nil {
 		fmt.Println("No .env file found, relying on system environment variables")
 	}
+
+	// Open a connection pool to Postgres. This doesn't actually connect yet -
+	// connections are made lazily as needed.
+	var err error
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Println("Failed to open database connection:", err)
+		os.Exit(1)
+	}
+
+	// Ping actually tests the connection right now, so we fail fast
+	// with a clear error if Postgres isn't reachable, instead of failing
+	// silently later on the first real request.
+	if err := db.Ping(); err != nil {
+		fmt.Println("Failed to connect to database:", err)
+		os.Exit(1)
+	}
+	fmt.Println("Connected to Postgres successfully")
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Costra is alive")
@@ -26,7 +50,7 @@ func main() {
 	http.HandleFunc("/v1/chat/completions", proxyToGroq)
 
 	fmt.Println("Costra server starting on :8080")
-	err := http.ListenAndServe(":8080", nil)
+	err = http.ListenAndServe(":8080", nil)
 	if err != nil {
 		fmt.Println("Server failed to start:", err)
 	}
@@ -37,29 +61,20 @@ type streamPeek struct {
 	Model  string `json:"model"`
 }
 
-// Usage matches the shape of the "usage" object Groq/OpenAI return.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// chatResponse is just enough of the non-streaming response shape
-// for us to pull "usage" out of it.
 type chatResponse struct {
 	Usage Usage `json:"usage"`
 }
 
-// streamChunk is just enough of a single streaming chunk's shape
-// to check if it happens to contain the final usage object.
 type streamChunk struct {
-	Usage *Usage `json:"usage"` // pointer, because most chunks WON'T have this field at all
+	Usage *Usage `json:"usage"`
 }
 
-// pricePerMillion holds cost in USD per 1,000,000 tokens, split by
-// input (prompt) and output (completion) tokens, since providers
-// price these differently. Values here are illustrative placeholders —
-// swap in real current pricing from Groq's pricing page.
 var pricePerMillion = map[string]struct {
 	Input  float64
 	Output float64
@@ -70,23 +85,41 @@ var pricePerMillion = map[string]struct {
 func calculateCost(model string, promptTokens, completionTokens int) float64 {
 	price, ok := pricePerMillion[model]
 	if !ok {
-		return 0 // unknown model - no pricing entry yet
+		return 0
 	}
 	inputCost := (float64(promptTokens) / 1_000_000) * price.Input
 	outputCost := (float64(completionTokens) / 1_000_000) * price.Output
 	return inputCost + outputCost
 }
 
-func logUsage(model string, usage Usage, latency time.Duration, streaming bool) {
+// logUsage now inserts a row into Postgres instead of just printing.
+// We still print too, for now, since it's a helpful sanity check while learning.
+func logUsage(model string, usage Usage, latency time.Duration, streaming bool, status string) {
 	cost := calculateCost(model, usage.PromptTokens, usage.CompletionTokens)
+	latencyMs := int(latency.Milliseconds())
+
 	fmt.Printf(
 		"[USAGE] model=%s stream=%v prompt_tokens=%d completion_tokens=%d total_tokens=%d cost=$%.6f latency=%s\n",
 		model, streaming, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cost, latency,
 	)
+
+	// $1, $2, $3... are placeholders - Postgres fills them in safely,
+	// which protects us from SQL injection compared to building the query
+	// string by hand.
+	_, err := db.Exec(
+		`INSERT INTO requests
+			(provider, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, streaming, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		"groq", model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens,
+		cost, latencyMs, streaming, status,
+	)
+	if err != nil {
+		fmt.Println("Failed to write usage log to database:", err)
+	}
 }
 
 func proxyToGroq(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now() // mark when we started, to measure latency later
+	startTime := time.Now()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -117,8 +150,13 @@ func proxyToGroq(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 
+	status := "success"
+	if resp.StatusCode >= 400 {
+		status = "error"
+	}
+
 	if peek.Stream {
-		streamAndCapture(w, resp.Body, peek.Model, startTime)
+		streamAndCapture(w, resp.Body, peek.Model, startTime, status)
 	} else {
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -130,14 +168,11 @@ func proxyToGroq(w http.ResponseWriter, r *http.Request) {
 		var parsed chatResponse
 		json.Unmarshal(respBody, &parsed)
 		latency := time.Since(startTime)
-		logUsage(peek.Model, parsed.Usage, latency, false)
+		logUsage(peek.Model, parsed.Usage, latency, false, status)
 	}
 }
 
-// streamAndCapture forwards chunks to the client as they arrive (same as
-// Phase 2), but ALSO inspects each chunk to catch the final one that
-// contains usage data, so we can log it once the stream ends.
-func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, startTime time.Time) {
+func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, startTime time.Time, status string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		io.Copy(w, body)
@@ -153,9 +188,6 @@ func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, start
 			w.Write([]byte(line))
 			flusher.Flush()
 
-			// Each SSE line looks like: "data: {...}\n"
-			// We strip the "data: " prefix and try to parse the JSON,
-			// checking if THIS particular chunk has a usage field.
 			trimmed := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 			if trimmed != "" && trimmed != "[DONE]" {
 				var chunk streamChunk
@@ -167,10 +199,10 @@ func streamAndCapture(w http.ResponseWriter, body io.Reader, model string, start
 			}
 		}
 		if err != nil {
-			break // stream ended
+			break
 		}
 	}
 
 	latency := time.Since(startTime)
-	logUsage(model, capturedUsage, latency, true)
+	logUsage(model, capturedUsage, latency, true, status)
 }
