@@ -37,12 +37,6 @@ var providers = map[string]Provider{
 	"gemini": GeminiProvider{},
 }
 
-// apiKeyEnvVar maps a provider name to the env var holding its API key.
-var apiKeyEnvVar = map[string]string{
-	"groq":   "GROQ_API_KEY",
-	"gemini": "GEMINI_API_KEY",
-}
-
 // pricePerMillion holds cost in USD per 1,000,000 tokens. Model names are
 // unique enough across providers that a flat map works fine for now.
 var pricePerMillion = map[string]struct {
@@ -128,7 +122,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.Model = override
 	}
 
-	apiKey := os.Getenv(apiKeyEnvVar[providerName])
+	apiKey, err := getProviderKey(providerName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	providerReq, err := provider.BuildRequest(chatReq, apiKey)
 	if err != nil {

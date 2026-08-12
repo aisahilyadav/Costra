@@ -38,6 +38,7 @@ func main() {
 	// {provider} is a URL path wildcard (Go 1.22+ routing feature) -
 	// r.PathValue("provider") retrieves it inside proxyHandler.
 	http.HandleFunc("/v1/chat/completions/{provider}", proxyHandler)
+	http.HandleFunc("/admin/keys", adminRegisterKey)
 
 	fmt.Println("Costra server starting on :8080")
 	err = http.ListenAndServe(":8080", nil)
