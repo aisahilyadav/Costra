@@ -30,6 +30,7 @@ func main() {
 	fmt.Println("Connected to Postgres successfully")
 
 	loadModelRoutes()
+	autoRegisterKeysFromEnv()
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Costra is alive")
@@ -39,6 +40,9 @@ func main() {
 	// r.PathValue("provider") retrieves it inside proxyHandler.
 	http.HandleFunc("/v1/chat/completions/{provider}", proxyHandler)
 	http.HandleFunc("/admin/keys", adminRegisterKey)
+	http.HandleFunc("/stats/summary", statsSummary)
+	http.HandleFunc("/stats/by-provider", statsByProvider)
+	http.HandleFunc("/stats/by-agent", statsByAgent)
 
 	fmt.Println("Costra server starting on :8080")
 	err = http.ListenAndServe(":8080", nil)

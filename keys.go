@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 )
 
 // storeProviderKey encrypts a plaintext API key and upserts it into the
@@ -39,7 +40,31 @@ func getProviderKey(provider string) (string, error) {
 	return decrypt(encrypted)
 }
 
-// registerKeyRequest is the expected JSON body for the admin endpoint.
+// envKeyMapping maps a provider name to the .env variable holding its key.
+// Add a line here whenever a new provider is added to Costra.
+var envKeyMapping = map[string]string{
+	"groq":   "GROQ_API_KEY",
+	"gemini": "GEMINI_API_KEY",
+}
+
+// autoRegisterKeysFromEnv checks .env for provider keys on every startup,
+// and if found, encrypts and saves them to the DB automatically - this is
+// what lets a user go from "filled in .env" to "fully working" with zero
+// manual API calls or dashboard clicks.
+func autoRegisterKeysFromEnv() {
+	for provider, envVar := range envKeyMapping {
+		value := os.Getenv(envVar)
+		if value == "" {
+			continue // nothing set for this provider in .env - skip it
+		}
+		if err := storeProviderKey(provider, value); err != nil {
+			fmt.Println("Failed to auto-register key for", provider, ":", err)
+			continue
+		}
+		fmt.Println("Auto-registered API key for provider:", provider)
+	}
+}
+
 type registerKeyRequest struct {
 	Provider string `json:"provider"`
 	APIKey   string `json:"api_key"`
